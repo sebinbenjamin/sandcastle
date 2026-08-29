@@ -31,24 +31,40 @@ const podmanExec = (args: string[]): Effect.Effect<string, PodmanError> =>
  * When `containerfile` is provided, uses `podman build -f <containerfile> <cwd>`
  * so COPY instructions resolve relative to the current working directory.
  * Otherwise, uses `podman build <containerfileDir>` (the default .sandcastle/ directory).
+ *
+ * `buildArgs` entries are passed as `--build-arg KEY=VALUE` flags, matching
+ * DockerLifecycle.buildImage.
  */
 export const buildImage = (
   imageName: string,
   containerfileDir: string,
-  options?: { readonly containerfile?: string },
+  options?: {
+    readonly containerfile?: string;
+    readonly buildArgs?: Record<string, string>;
+  },
 ): Effect.Effect<void, PodmanError> =>
   Effect.gen(function* () {
+    const buildArgFlags = Object.entries(options?.buildArgs ?? {}).flatMap(
+      ([k, v]) => ["--build-arg", `${k}=${v}`],
+    );
     if (options?.containerfile) {
       yield* podmanExec([
         "build",
         "-t",
         imageName,
+        ...buildArgFlags,
         "-f",
         resolve(options.containerfile),
         process.cwd(),
       ]);
     } else {
-      yield* podmanExec(["build", "-t", imageName, resolve(containerfileDir)]);
+      yield* podmanExec([
+        "build",
+        "-t",
+        imageName,
+        ...buildArgFlags,
+        resolve(containerfileDir),
+      ]);
     }
   });
 

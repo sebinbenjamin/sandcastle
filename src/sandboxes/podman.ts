@@ -22,6 +22,8 @@ import {
   type ExecResult,
   type InteractiveExecOptions,
 } from "../SandboxProvider.js";
+import { buildImage as buildImageEffect } from "../PodmanLifecycle.js";
+import { Effect } from "effect";
 import type { MountConfig } from "../MountConfig.js";
 import type { SelinuxLabel } from "../mountUtils.js";
 import {
@@ -458,6 +460,24 @@ export const podman = (options?: PodmanOptions): SandboxProvider => {
 
 // Re-export for backwards compatibility
 export { defaultImageName };
+
+/**
+ * Build the sandcastle Podman image (promise-based wrapper around the
+ * internal lifecycle effect).
+ *
+ * When `options.containerfile` is given, the build context is `process.cwd()`
+ * so COPY instructions resolve against the repo root. `options.buildArgs`
+ * entries are passed as `--build-arg KEY=VALUE` flags.
+ */
+export const buildImage = (
+  imageName: string,
+  containerfileDir: string,
+  options?: {
+    readonly containerfile?: string;
+    readonly buildArgs?: Record<string, string>;
+  },
+): Promise<void> =>
+  Effect.runPromise(buildImageEffect(imageName, containerfileDir, options));
 
 const checkImageExists = (imageName: string): Promise<void> =>
   new Promise<void>((resolve, reject) => {

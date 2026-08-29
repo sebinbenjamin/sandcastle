@@ -158,6 +158,40 @@ describe("sandcastle CLI", () => {
     expect(stdout).toContain("--image-name");
   });
 
+  it("docker build-image --help shows the repeatable --build-arg flag", async () => {
+    const { stdout } = await runCli("docker build-image --help", process.cwd());
+    expect(stdout).toContain("--build-arg");
+    expect(stdout).toContain("KEY=VALUE");
+  });
+
+  it("podman build-image --help shows the repeatable --build-arg flag", async () => {
+    const { stdout } = await runCli("podman build-image --help", process.cwd());
+    expect(stdout).toContain("--build-arg");
+  });
+
+  it("docker build-image rejects a --build-arg without KEY=VALUE form", async () => {
+    const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
+    await initRepo(hostDir);
+    await commitFile(hostDir, "hello.txt", "hello", "initial commit");
+    // A config dir is required before build-args are parsed.
+    const { mkdir, writeFile } = await import("node:fs/promises");
+    await mkdir(join(hostDir, ".sandcastle"));
+    await writeFile(
+      join(hostDir, ".sandcastle", "Dockerfile"),
+      "FROM node:22-bookworm\n",
+    );
+
+    try {
+      await runCli("docker build-image --build-arg INVALID", hostDir);
+      expect.fail("Expected command to fail");
+    } catch (err: unknown) {
+      const { stdout, stderr } = err as { stdout: string; stderr: string };
+      const output = stdout + stderr;
+      expect(output).toContain("Invalid --build-arg");
+      expect(output).toContain("KEY=VALUE");
+    }
+  });
+
   it("podman build-image errors when .sandcastle/ is missing", async () => {
     const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
     await initRepo(hostDir);

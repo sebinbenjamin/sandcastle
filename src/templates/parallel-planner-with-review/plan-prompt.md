@@ -22,7 +22,7 @@ An issue B is **blocked by** issue A if:
 
 An issue is **unblocked** if it has zero blocking dependencies on other open issues.
 
-For each unblocked issue, assign a branch name using the exact format `sandcastle/issue-{id}` (no slug or other suffix). This must be deterministic so that re-planning the same issue always produces the same branch name and accumulated progress is preserved.
+For each unblocked issue, assign a branch name using the exact format `sandcastle/issue-{id}` (no slug or other suffix). This must be deterministic so that re-planning the same issue always produces the same branch name and accumulated progress is preserved. This convention is mandatory: a plan that deviates from it is rejected by schema validation and aborts the run.
 
 # OUTPUT
 
@@ -35,3 +35,5 @@ Output your plan as a JSON object wrapped in `<plan>` tags:
 Include only unblocked issues. If every issue is blocked, include the single highest-priority candidate (the one with the fewest or weakest dependencies).
 
 Always emit the `<plan>` tags, even when there is nothing to do. If there are no issues to work on at all, output `<plan>{"issues": []}</plan>` so the run can exit cleanly.
+
+When the plan is emitted, output <promise>COMPLETE</promise> to end the run.

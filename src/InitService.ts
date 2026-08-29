@@ -27,6 +27,17 @@ export interface TemplateMetadata {
    * `npx tsx .sandcastle/main.ts` doesn't crash with ERR_MODULE_NOT_FOUND.
    */
   dependencies?: readonly string[];
+  /**
+   * The template picks its agent provider at run time instead of being bound
+   * to the agent chosen at init. Scaffolded projects get a Dockerfile that
+   * installs every supported CLI (so `SANDCASTLE_AGENT` can switch providers
+   * without a rebuild), a `.env.example` documenting the per-provider env
+   * blocks, and a config section in `main` seeded with the init-selected
+   * defaults. Init also skips the agent-factory/model rewrite for these
+   * templates — their factories come from the config section, not from
+   * hard-coded calls.
+   */
+  providerSelectable?: boolean;
 }
 
 const TEMPLATES: TemplateMetadata[] = [
@@ -48,16 +59,26 @@ const TEMPLATES: TemplateMetadata[] = [
     description:
       "Plans parallelizable issues, executes on separate branches, merges",
     dependencies: ["zod"],
+    providerSelectable: true,
   },
   {
     name: "parallel-planner-with-review",
     description:
       "Plans parallelizable issues, executes with per-branch review, merges",
     dependencies: ["zod"],
+    providerSelectable: true,
   },
 ];
 
 export const listTemplates = (): TemplateMetadata[] => TEMPLATES;
+
+/**
+ * Whether the given template picks its agent provider at run time (via
+ * `SANDCASTLE_AGENT` in `.sandcastle/.env` or the process env). Unknown
+ * template names are treated as not provider-selectable.
+ */
+export const isProviderSelectableTemplate = (templateName: string): boolean =>
+  TEMPLATES.find((t) => t.name === templateName)?.providerSelectable === true;
 
 /**
  * Host-side npm packages the given template imports directly. Empty when the
@@ -305,6 +326,54 @@ WORKDIR /home/agent
 ENTRYPOINT ["sleep", "infinity"]
 `;
 
+/**
+ * Dockerfile for provider-selectable templates: installs both supported agent
+ * CLIs (Claude Code and Codex) so `SANDCASTLE_AGENT` can switch providers at
+ * run time without rebuilding the image. Codex is installed via npm as root
+ * (its global executable must be visible to the unprivileged agent user);
+ * the Claude CLI is installed by its curl installer as the agent user.
+ * Written regardless of which agent was selected at init.
+ */
+const MULTI_AGENT_DOCKERFILE = `FROM node:22-bookworm
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \\
+  git \\
+  curl \\
+  jq \\
+  && rm -rf /var/lib/apt/lists/*
+
+{{ISSUE_TRACKER_TOOLS}}
+
+# Build-args for UID/GID alignment: sandcastle docker build-image
+# defaults these to the host user's UID/GID so image-built files
+# and bind-mounted files share an owner without runtime chown.
+ARG AGENT_UID=1000
+ARG AGENT_GID=1000
+
+# Rename the base image's "node" user to "agent" and align UID/GID.
+RUN groupmod -o -g $AGENT_GID node && usermod -o -u $AGENT_UID -g $AGENT_GID -d /home/agent -m -l agent node
+
+# Install Codex CLI as root so its global executable is available to the
+# unprivileged agent user at runtime.
+RUN npm install -g @openai/codex
+
+USER \${AGENT_UID}:\${AGENT_GID}
+
+# Install Claude Code CLI as the agent user.
+RUN curl -fsSL https://claude.ai/install.sh | bash
+
+# Add Claude Code to PATH
+ENV PATH="/home/agent/.local/bin:$PATH"
+
+WORKDIR /home/agent
+
+# In worktree sandbox mode, Sandcastle bind-mounts the git worktree at ${SANDBOX_REPO_DIR}
+# and overrides the working directory to ${SANDBOX_REPO_DIR} at container start.
+# Structure your Dockerfile so that ${SANDBOX_REPO_DIR} can serve as the project root.
+ENTRYPOINT ["sleep", "infinity"]
+`;
+
 const CURSOR_DOCKERFILE = `FROM node:22-bookworm
 
 # Install system dependencies
@@ -476,6 +545,33 @@ GITHUB_TOKEN=`,
 ];
 
 export const listAgents = (): AgentEntry[] => AGENT_REGISTRY;
+
+/**
+ * Build the `.env.example` for provider-selectable templates: the
+ * `SANDCASTLE_*` selection knobs, plus the env block of every supported agent
+ * provider so switching `SANDCASTLE_AGENT` never requires re-running init.
+ * Empty values are treated as unset by the template's config reader, so the
+ * knobs ship commented out.
+ */
+const buildProviderSelectableEnvExample = (): string =>
+  [
+    "# Agent provider selection — which agent runs the planner and workers.",
+    '# "claude" or "codex". Leave unset to keep the default seeded by init.',
+    "# SANDCASTLE_AGENT=codex",
+    "# Per-role model overrides. Unset keys fall back to the defaults in main.",
+    "# SANDCASTLE_CLAUDE_PLANNER_MODEL=",
+    "# SANDCASTLE_CLAUDE_WORKER_MODEL=",
+    "# SANDCASTLE_CODEX_PLANNER_MODEL=",
+    "# SANDCASTLE_CODEX_WORKER_MODEL=",
+    "# Codex reasoning effort: low | medium | high | xhigh (default: high)",
+    "# SANDCASTLE_CODEX_EFFORT=high",
+    "",
+    `# --- Claude Code (used when SANDCASTLE_AGENT=claude) ---`,
+    getAgent("claude-code")!.envExample,
+    "",
+    `# --- Codex (used when SANDCASTLE_AGENT=codex) ---`,
+    getAgent("codex")!.envExample,
+  ].join("\n") + "\n";
 
 // ---------------------------------------------------------------------------
 // Issue tracker registry (internal — not part of public API)
@@ -679,6 +775,11 @@ export function getNextStepsLines(
         `${step++}. Install a schema validator for the planner's \`<plan>\` output — the template uses Zod (\`${addDependencyCommand(packageManager, "zod")}\`), but Valibot, ArkType, or any Standard Schema library works (https://standardschema.dev)`,
       );
     }
+    if (isProviderSelectableTemplate(template)) {
+      lines.push(
+        `${step++}. Switch agent providers without rebuilding — the sandbox image ships both CLIs. Set the knobs in .sandcastle/.env or the process env (.sandcastle/.env wins): SANDCASTLE_AGENT=claude|codex, SANDCASTLE_CLAUDE_PLANNER_MODEL, SANDCASTLE_CLAUDE_WORKER_MODEL, SANDCASTLE_CODEX_PLANNER_MODEL, SANDCASTLE_CODEX_WORKER_MODEL, SANDCASTLE_CODEX_EFFORT=low|medium|high|xhigh`,
+      );
+    }
     lines.push(
       `${step++}. Read and customize the prompt files in .sandcastle/ — they shape what the agent does`,
     );
@@ -754,12 +855,40 @@ const copyTemplateFiles = (
     );
   });
 
+/** Defaults seeded into a provider-selectable template's main file. */
+export interface ProviderDefaults {
+  /** `"claude"` or `"codex"` — seeds `{{DEFAULT_AGENT}}`. */
+  readonly agent: string;
+  /** Seeds `{{DEFAULT_PLANNER_MODEL}}`. */
+  readonly plannerModel: string;
+  /** Seeds `{{DEFAULT_WORKER_MODEL}}`. */
+  readonly workerModel: string;
+}
+
+/**
+ * Map the init-selected agent to a provider-selectable template's
+ * `SANDCASTLE_AGENT` value. These templates only support Claude and Codex;
+ * any other agent selection falls back to claude (the dual-CLI image keeps
+ * the choice switchable via `.env` without a rebuild).
+ */
+const toSelectableAgentName = (agent: AgentEntry): string =>
+  agent.name === "codex" ? "codex" : "claude";
+
 /**
  * Replace the agent factory and sandbox provider in a scaffolded main.ts.
  *
  * Templates use `claudeCode` as the default agent factory and `docker` as the
  * default sandbox provider. When a different agent, model, or sandbox provider
  * is selected, this function rewrites the imports and factory calls.
+ *
+ * For provider-selectable templates (see `TemplateMetadata.providerSelectable`),
+ * pass `providerDefaults`: the agent-factory/model rewrite is skipped (their
+ * factories are resolved at run time from an inlined config section that
+ * references both factories, which the blanket rewrite would clobber) and the
+ * init-selected defaults are seeded via `{{DEFAULT_*}}` tokens instead. The
+ * sandbox-provider rewrite still applies — it also rewrites the `"docker"`
+ * spawn strings in the template's image-inspection code, keeping the
+ * dependency-image check podman-compatible for free.
  */
 const rewriteMainTs = (
   configDir: string,
@@ -767,6 +896,7 @@ const rewriteMainTs = (
   model: string,
   sandboxProvider: SandboxProviderEntry,
   mainFilename: string,
+  providerDefaults?: ProviderDefaults,
 ): Effect.Effect<void, Error, FileSystem.FileSystem> =>
   Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem;
@@ -787,19 +917,28 @@ const rewriteMainTs = (
       content = content.replace(/main\.mts/g, "main.ts");
     }
 
-    // Replace factory function name in imports (e.g. claudeCode → pi)
-    // and all factory calls with the correct model.
-    // Templates always use claudeCode as the placeholder factory.
-    content = content.replace(/\bclaudeCode\b/g, agent.factoryImport);
-    // Replace model strings in factory calls: factoryImport("any-model")
-    const factoryCallRe = new RegExp(
-      `${agent.factoryImport}\\(["']([^"']+)["']\\)`,
-      "g",
-    );
-    content = content.replace(
-      factoryCallRe,
-      `${agent.factoryImport}("${model}")`,
-    );
+    if (providerDefaults) {
+      // Provider-selectable templates: seed the init-selected defaults via
+      // plain string replacement (no regex — model names are user input).
+      content = content
+        .replaceAll("{{DEFAULT_AGENT}}", providerDefaults.agent)
+        .replaceAll("{{DEFAULT_PLANNER_MODEL}}", providerDefaults.plannerModel)
+        .replaceAll("{{DEFAULT_WORKER_MODEL}}", providerDefaults.workerModel);
+    } else {
+      // Replace factory function name in imports (e.g. claudeCode → pi)
+      // and all factory calls with the correct model.
+      // Templates always use claudeCode as the placeholder factory.
+      content = content.replace(/\bclaudeCode\b/g, agent.factoryImport);
+      // Replace model strings in factory calls: factoryImport("any-model")
+      const factoryCallRe = new RegExp(
+        `${agent.factoryImport}\\(["']([^"']+)["']\\)`,
+        "g",
+      );
+      content = content.replace(
+        factoryCallRe,
+        `${agent.factoryImport}("${model}")`,
+      );
+    }
 
     // Replace the sandbox provider. Templates always use `docker` as the
     // placeholder, where the registry name doubles as both the factory function
@@ -1043,25 +1182,37 @@ export const scaffold = (
 
     const mainFilename = yield* detectMainFilename(repoDir);
 
+    const providerSelectable = isProviderSelectableTemplate(templateName);
+
     yield* fs
       .makeDirectory(configDir, { recursive: false })
       .pipe(Effect.mapError((e) => new Error(e.message)));
 
     const templateDir = yield* getTemplateDir(templateName);
 
-    // Build .env.example from agent + issue tracker env blocks
-    const envExampleParts = [agent.envExample];
+    // Build .env.example from agent + issue tracker env blocks.
+    // Provider-selectable templates document every supported provider's env
+    // block instead of only the init-selected agent.
+    const envExampleParts = providerSelectable
+      ? [buildProviderSelectableEnvExample()]
+      : [agent.envExample];
     if (issueTracker.envExample) {
       envExampleParts.push(issueTracker.envExample);
     }
     const envExampleContent = envExampleParts.join("\n") + "\n";
+
+    // Provider-selectable templates always get the dual-CLI image so
+    // SANDCASTLE_AGENT can switch providers without a rebuild.
+    const containerfileContent = providerSelectable
+      ? MULTI_AGENT_DOCKERFILE
+      : agent.dockerfileTemplate;
 
     yield* Effect.all(
       [
         fs
           .writeFileString(
             join(configDir, sandboxProvider.containerfileName),
-            agent.dockerfileTemplate,
+            containerfileContent,
           )
           .pipe(Effect.mapError((e) => new Error(e.message))),
         fs
@@ -1075,13 +1226,23 @@ export const scaffold = (
       { concurrency: "unbounded" },
     );
 
-    // Rewrite main file with the selected agent factory, model, and sandbox provider
+    // Rewrite main file with the selected agent factory, model, and sandbox provider.
+    // Provider-selectable templates skip the factory/model rewrite (the config
+    // section owns agent selection) and get the init choices seeded as defaults.
     yield* rewriteMainTs(
       configDir,
       agent,
       model,
       sandboxProvider,
       mainFilename,
+      providerSelectable
+        ? {
+            agent: toSelectableAgentName(agent),
+            // --model seeds both role defaults; .env refines per role.
+            plannerModel: model,
+            workerModel: model,
+          }
+        : undefined,
     );
 
     // Replace issue tracker template arguments in all text files (must run before label stripping)

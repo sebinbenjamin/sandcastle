@@ -15,7 +15,11 @@ import {
 import { randomUUID } from "node:crypto";
 import { createInterface } from "node:readline";
 import { Effect } from "effect";
-import { startContainer, removeContainer } from "../DockerLifecycle.js";
+import {
+  startContainer,
+  removeContainer,
+  buildImage as buildImageEffect,
+} from "../DockerLifecycle.js";
 import {
   createBindMountSandboxProvider,
   type SandboxProvider,
@@ -392,8 +396,39 @@ export const docker = (options?: DockerOptions): SandboxProvider => {
   });
 };
 
-// Re-export for backwards compatibility
+// Re-export for backwards compatibility, plus buildImage so end-user scripts
+// (e.g. dependency-image stale detection in orchestration templates) can
+// rebuild the image with custom build args without importing internals.
 export { defaultImageName };
+
+/**
+ * Build the sandcastle Docker image (promise-based wrapper around the
+ * internal lifecycle effect).
+ *
+ * When `options.containerfile` is given, the build context is `process.cwd()`
+ * so COPY instructions resolve against the repo root. `options.buildArgs`
+ * entries are passed as `--build-arg KEY=VALUE` flags.
+ *
+ * The option key is `containerfile` (not `dockerfile`) so this export and the
+ * podman one share a shape — orchestration scripts that are provider-agnostic
+ * (like the planner templates, which init rewrites between docker and podman)
+ * can pass the same options to either.
+ */
+export const buildImage = (
+  imageName: string,
+  dockerfileDir: string,
+  options?: {
+    /** Path to the image definition (a Dockerfile). The generic key name keeps this export interchangeable with the podman one. */
+    readonly containerfile?: string;
+    readonly buildArgs?: Record<string, string>;
+  },
+): Promise<void> =>
+  Effect.runPromise(
+    buildImageEffect(imageName, dockerfileDir, {
+      dockerfile: options?.containerfile,
+      buildArgs: options?.buildArgs,
+    }),
+  );
 
 const checkImageUid = (imageName: string, expectedUid: number): Promise<void> =>
   new Promise<void>((resolve, reject) => {

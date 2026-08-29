@@ -1013,16 +1013,23 @@ describe("InitService scaffold", () => {
       expect(mainTs).toContain('"@ai-hero/sandcastle"');
     });
 
-    it("main.mts references the specified model for all factory calls", async () => {
+    it("seeds the init-selected model into the provider-selectable config", async () => {
       const dir = await makeDir();
-      await runScaffold(dir, { templateName: "parallel-planner" });
+      await runScaffold(dir, {
+        templateName: "parallel-planner",
+        model: "claude-opus-4-9",
+      });
 
       const mainTs = await readFile(
         join(dir, ".sandcastle", "main.mts"),
         "utf-8",
       );
-      // All factory calls should use the specified model (default: claude-opus-4-8)
-      expect(mainTs).toContain("claude-opus-4-8");
+      // The provider-selectable config owns model selection — the tokens are
+      // seeded with the init-selected model and no {{...}} placeholder survives.
+      expect(mainTs).not.toContain("{{DEFAULT_PLANNER_MODEL}}");
+      expect(mainTs).not.toContain("{{DEFAULT_WORKER_MODEL}}");
+      expect(mainTs).toContain('DEFAULT_PLANNER_MODEL = "claude-opus-4-9"');
+      expect(mainTs).toContain('DEFAULT_WORKER_MODEL = "claude-opus-4-9"');
     });
 
     it("implement-prompt.md contains {{TASK_ID}}, {{ISSUE_TITLE}}, {{BRANCH}} prompt arguments", async () => {
@@ -1266,15 +1273,21 @@ describe("InitService scaffold", () => {
       expect(envExample).toContain("GH_TOKEN=");
     });
 
-    it("main.mts references the specified model for all factory calls", async () => {
+    it("seeds the init-selected model into the provider-selectable config", async () => {
       const dir = await makeDir();
-      await runScaffold(dir, { templateName: "parallel-planner-with-review" });
+      await runScaffold(dir, {
+        templateName: "parallel-planner-with-review",
+        model: "claude-opus-4-9",
+      });
 
       const mainTs = await readFile(
         join(dir, ".sandcastle", "main.mts"),
         "utf-8",
       );
-      expect(mainTs).toContain("claude-opus-4-8");
+      expect(mainTs).not.toContain("{{DEFAULT_PLANNER_MODEL}}");
+      expect(mainTs).not.toContain("{{DEFAULT_WORKER_MODEL}}");
+      expect(mainTs).toContain('DEFAULT_PLANNER_MODEL = "claude-opus-4-9"');
+      expect(mainTs).toContain('DEFAULT_WORKER_MODEL = "claude-opus-4-9"');
     });
 
     it("scaffolds CODING_STANDARDS.md with minimal starter content", async () => {

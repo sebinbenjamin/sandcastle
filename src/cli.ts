@@ -542,19 +542,56 @@ const dockerfileOption = Options.file("dockerfile").pipe(
   Options.optional,
 );
 
+/** Repeatable `KEY=VALUE` build-arg passed through to the builder. */
+const buildArgOption = Options.text("build-arg").pipe(
+  Options.withDescription(
+    "Build arg in KEY=VALUE form (repeatable). Overrides the default AGENT_UID/AGENT_GID alignment args",
+  ),
+  Options.repeated,
+);
+
+/**
+ * Parse `KEY=VALUE` entries from `--build-arg` flags into a record. The last
+ * occurrence of a key wins; entries without a "=" fail the command with an
+ * InitError so the CLI can surface it as a friendly message.
+ */
+const parseBuildArgs = (
+  entries: readonly string[],
+): Effect.Effect<Record<string, string>, InitError> =>
+  Effect.try({
+    try: () =>
+      Object.fromEntries(
+        entries.map((entry) => {
+          const separator = entry.indexOf("=");
+          if (separator <= 0) {
+            throw new Error(
+              `Invalid --build-arg "${entry}". Expected KEY=VALUE form.`,
+            );
+          }
+          return [
+            entry.slice(0, separator),
+            entry.slice(separator + 1),
+          ] as const;
+        }),
+      ),
+    catch: (e) => new InitError({ message: (e as Error).message }),
+  });
+
 const buildImageCommand = Command.make(
   "build-image",
   {
     imageName: imageNameOption,
     dockerfile: dockerfileOption,
+    buildArg: buildArgOption,
   },
-  ({ imageName: imageNameFlag, dockerfile }) =>
+  ({ imageName: imageNameFlag, dockerfile, buildArg }) =>
     Effect.gen(function* () {
       const d = yield* Display;
       const cwd = process.cwd();
       yield* requireConfigDir(cwd);
 
       const imageName = resolveImageName(imageNameFlag, cwd);
+      const parsedArgs = yield* parseBuildArgs(buildArg);
 
       const dockerfileDir = join(cwd, CONFIG_DIR);
       const dockerfilePath =
@@ -564,7 +601,8 @@ const buildImageCommand = Command.make(
         `Building Docker image '${imageName}'...`,
         buildImage(imageName, dockerfileDir, {
           dockerfile: dockerfilePath,
-          buildArgs: defaultUidBuildArgs(),
+          // Explicit --build-arg flags win over the default UID/GID alignment.
+          buildArgs: { ...defaultUidBuildArgs(), ...parsedArgs },
         }),
       );
 
@@ -620,14 +658,16 @@ const podmanBuildImageCommand = Command.make(
   {
     imageName: imageNameOption,
     containerfile: containerfileOption,
+    buildArg: buildArgOption,
   },
-  ({ imageName: imageNameFlag, containerfile }) =>
+  ({ imageName: imageNameFlag, containerfile, buildArg }) =>
     Effect.gen(function* () {
       const d = yield* Display;
       const cwd = process.cwd();
       yield* requireConfigDir(cwd);
 
       const imageName = resolveImageName(imageNameFlag, cwd);
+      const parsedArgs = yield* parseBuildArgs(buildArg);
 
       const containerfileDir = join(cwd, CONFIG_DIR);
       const containerfilePath =
@@ -636,6 +676,8 @@ const podmanBuildImageCommand = Command.make(
         `Building Podman image '${imageName}'...`,
         podmanBuildImage(imageName, containerfileDir, {
           containerfile: containerfilePath,
+          // Explicit --build-arg flags win over the default UID/GID alignment.
+          buildArgs: { ...defaultUidBuildArgs(), ...parsedArgs },
         }),
       );
 
