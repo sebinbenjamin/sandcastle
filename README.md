@@ -761,6 +761,31 @@ try {
 
 Select a template during `sandcastle init` when prompted, or re-run init in a fresh repo to try a different one.
 
+#### Provider-selectable planner templates
+
+The two `parallel-planner` templates are **provider-selectable**: the scaffolded `main.ts` reads `SANDCASTLE_AGENT` at runtime instead of hard-coding an agent factory, switching between Claude Code and Codex. The scaffolded image installs **both CLIs**, so switching provider, model, or reasoning effort needs no re-init and no image rebuild.
+
+`init --agent` and `--model` seed the template's defaults (e.g. `--agent codex --model gpt-5.4` makes Codex the default provider); these env knobs override them per run:
+
+| Variable                          | Values                                 | Default                  |
+| --------------------------------- | -------------------------------------- | ------------------------ |
+| `SANDCASTLE_AGENT`                | `claude` \| `codex`                    | the agent chosen at init |
+| `SANDCASTLE_CLAUDE_PLANNER_MODEL` | any Claude model                       | the model chosen at init |
+| `SANDCASTLE_CLAUDE_WORKER_MODEL`  | any Claude model                       | the model chosen at init |
+| `SANDCASTLE_CODEX_PLANNER_MODEL`  | any Codex model                        | the model chosen at init |
+| `SANDCASTLE_CODEX_WORKER_MODEL`   | any Codex model                        | the model chosen at init |
+| `SANDCASTLE_CODEX_EFFORT`         | `low` \| `medium` \| `high` \| `xhigh` | `high`                   |
+
+Knobs are read from `.sandcastle/.env` first, then the process env — copy the scaffolded `.env.example` to `.sandcastle/.env` and uncomment what you need (a non-empty `.env` value wins).
+
+Both templates also inline a set of orchestration safety checks:
+
+- **Clean-worktree precheck** — a round refuses to start with uncommitted host changes, so merges always land on the branch you think they do.
+- **Plan schema hardening** — the planner's `<plan>` output is validated for unique issue ids and the `sandcastle/issue-<id>` branch convention; a deviating plan aborts the run.
+- **Completion-signal gates** — a planner or merger run that never emitted its completion signal aborts the run; an implementer (or reviewer) that didn't finish is excluded from the merge set rather than merged half-done.
+- **Merge gating** — every worker branch is checked for unmerged commits before merging, and merges use `--no-ff` so a branch already merged by an earlier run is detected: it skips implementation but still reaches the merger, which closes its issue without re-merging.
+- **Cancellation** — `Ctrl+C` aborts in-flight agent runs and removes the sandboxes' containers; the interrupted round prints a reason and exits non-zero without merging.
+
 ## CLI commands
 
 ### `sandcastle init`
@@ -768,6 +793,8 @@ Select a template during `sandcastle init` when prompted, or re-run init in a fr
 Scaffolds the `.sandcastle/` config directory and builds the container image. This is the first command you run in a new repo. You choose a sandbox provider (Docker or Podman) during init — selecting Podman writes a `Containerfile` instead of `Dockerfile` and uses `sandcastle podman build-image` for the build step.
 
 Init detects your host package manager (npm, pnpm, yarn, or bun) from a `packageManager` field or lockfile, defaulting to npm. Templates whose `main` file imports a host dependency — the planner templates import [Zod](https://zod.dev) for their `<plan>` output schema — prompt you to install it with that package manager when it isn't already in your `package.json`, so the first `npx tsx .sandcastle/main.ts` doesn't fail with `ERR_MODULE_NOT_FOUND`.
+
+For the [provider-selectable planner templates](#provider-selectable-planner-templates), `--agent` and `--model` seed the template's defaults instead of baking in a provider — the scaffolded image ships both the Claude Code and Codex CLIs and the choice stays switchable at runtime via env knobs.
 
 Every interactive prompt has a paired `--flag` so the entire init can run non-interactively (e.g. in CI or a scripted setup). When stdin is not a TTY and a required flag is missing, init fails fast with a clear error rather than wedging on a prompt.
 
@@ -797,12 +824,28 @@ Errors if `.sandcastle/` already exists to prevent overwriting customizations.
 
 ### `sandcastle docker build-image`
 
-Rebuilds the Docker image from an existing `.sandcastle/` directory. Use this after modifying the Dockerfile. On Linux/macOS, the build automatically passes `--build-arg AGENT_UID=$(id -u)` and `AGENT_GID=$(id -g)` so the image's `agent` user matches the host UID — this prevents permission errors on image-built files without runtime chown.
+Rebuilds the Docker image from an existing `.sandcastle/` directory. Use this after modifying the Dockerfile. On Linux/macOS, the build automatically passes `--build-arg AGENT_UID=$(id -u)` and `AGENT_GID=$(id -g)` so the image's `agent` user matches the host UID — this prevents permission errors on image-built files without runtime chown. Explicit `--build-arg` flags win over those defaults.
 
-| Option         | Required | Default                      | Description                                                                       |
-| -------------- | -------- | ---------------------------- | --------------------------------------------------------------------------------- |
-| `--image-name` | No       | `sandcastle:<repo-dir-name>` | Docker image name                                                                 |
-| `--dockerfile` | No       | —                            | Path to a custom Dockerfile (build context will be the current working directory) |
+| Option         | Required | Default                      | Description                                                                             |
+| -------------- | -------- | ---------------------------- | --------------------------------------------------------------------------------------- |
+| `--image-name` | No       | `sandcastle:<repo-dir-name>` | Docker image name                                                                       |
+| `--dockerfile` | No       | —                            | Path to a custom Dockerfile (build context will be the current working directory)       |
+| `--build-arg`  | No       | —                            | Build arg in `KEY=VALUE` form (repeatable), e.g. `--build-arg DEPENDENCY_LOCK_SHA256=…` |
+
+The same build is available programmatically for orchestration scripts — both sandbox subpaths export a promise-based `buildImage` with the same signature:
+
+```typescript
+import { buildImage } from "@ai-hero/sandcastle/sandboxes/docker";
+// or "@ai-hero/sandcastle/sandboxes/podman" — same shape
+
+await buildImage("sandcastle:myrepo", ".sandcastle", {
+  // Optional — builds the given Dockerfile/Containerfile with the repo root
+  // as build context. Omit to build the .sandcastle/ directory's default.
+  containerfile: ".sandcastle/Dockerfile",
+  // Optional — passed through as --build-arg KEY=VALUE flags.
+  buildArgs: { DEPENDENCY_LOCK_SHA256: "…" },
+});
+```
 
 ### `sandcastle docker remove-image`
 
@@ -814,12 +857,13 @@ Removes the Docker image.
 
 ### `sandcastle podman build-image`
 
-Builds the Podman image from an existing `.sandcastle/` directory. Use this after modifying the Containerfile.
+Builds the Podman image from an existing `.sandcastle/` directory. Use this after modifying the Containerfile. Like the Docker command, it passes the `AGENT_UID`/`AGENT_GID` alignment args on Linux/macOS (explicit `--build-arg` flags win).
 
 | Option            | Required | Default                      | Description                                                                          |
 | ----------------- | -------- | ---------------------------- | ------------------------------------------------------------------------------------ |
 | `--image-name`    | No       | `sandcastle:<repo-dir-name>` | Podman image name                                                                    |
 | `--containerfile` | No       | —                            | Path to a custom Containerfile (build context will be the current working directory) |
+| `--build-arg`     | No       | —                            | Build arg in `KEY=VALUE` form (repeatable)                                           |
 
 ### `sandcastle podman remove-image`
 
@@ -1351,6 +1395,185 @@ When customizing the Dockerfile, ensure you keep:
 
 Add your project-specific dependencies (e.g., language runtimes, build tools) to the Dockerfile as needed.
 
+### Baked dependency image (optional)
+
+The default setup copies host `node_modules` into each worktree and runs `npm install` as a sandbox hook. That's simple, but it makes every sandbox start pay for an install inside the container — noticeable on large trees, and slow on Windows where npm works over a bind-mounted filesystem.
+
+The alternative is baking the locked dependency tree into the image, keyed on the lockfile hash, and having sandboxes symlink to it:
+
+**1. Extend `.sandcastle/Dockerfile`** — install the locked tree into a cache directory outside the bind-mounted worktree and stamp the image with the lockfile's sha256. Place this after the `USER` directive so `npm ci` runs as the `agent` user:
+
+```dockerfile
+ENV SANDCASTLE_DEPENDENCY_CACHE_ROOT="/home/agent/dependency-cache"
+WORKDIR ${SANDCASTLE_DEPENDENCY_CACHE_ROOT}
+COPY --chown=${AGENT_UID}:${AGENT_GID} package.json package-lock.json ./
+
+# Stamps the image with the lockfile hash the planner templates' stale check reads.
+ARG DEPENDENCY_LOCK_SHA256
+LABEL sandcastle.dependency-lock.sha256=${DEPENDENCY_LOCK_SHA256}
+
+# The grep guard fails the build when the arg is missing — otherwise the label
+# would be empty and stale detection would silently skip the image.
+RUN echo "${DEPENDENCY_LOCK_SHA256}" | grep -Eq '^[a-f0-9]{64}$' \
+  && npm ci --ignore-scripts --no-audit \
+  && printf '%s\n' "${DEPENDENCY_LOCK_SHA256}" > .package-lock.sha256 \
+  && ln -s "${SANDCASTLE_DEPENDENCY_CACHE_ROOT}/node_modules" /home/agent/node_modules
+
+WORKDIR /home/agent
+```
+
+The recipe is npm-lockfile-based (`package-lock.json` is what the hash covers); projects on other package managers are better served by the default copy strategy.
+
+**2. Add `.sandcastle/prepare-dependencies.sh`** — an image rebuild only happens between runs, so this sandbox hook refreshes the cache inside a running container when the lockfile drifts mid-run, then links `node_modules` into the worktree:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+cache_root="${SANDCASTLE_DEPENDENCY_CACHE_ROOT:-/home/agent/dependency-cache}"
+marker_path="${cache_root}/.package-lock.sha256"
+dependency_link="${SANDCASTLE_WORKSPACE_ROOT:-$(pwd)}/node_modules"
+
+current_hash="$(sha256sum package-lock.json | cut -d ' ' -f 1)"
+cached_hash=""
+if [[ -f "${marker_path}" ]]; then
+  cached_hash="$(tr -d '[:space:]' < "${marker_path}")"
+fi
+
+if [[ "${current_hash}" != "${cached_hash}" ]]; then
+  echo "Dependency lock changed; refreshing this container's node_modules."
+  cp package.json package-lock.json "${cache_root}/"
+  (cd "${cache_root}" && npm ci --ignore-scripts --no-audit --prefer-offline)
+  printf '%s\n' "${current_hash}" > "${marker_path}"
+else
+  echo "Dependency cache is current; reusing baked node_modules."
+fi
+
+if [[ -e "${dependency_link}" && ! -L "${dependency_link}" ]]; then
+  echo "Refusing to replace existing non-symlink node_modules." >&2
+  exit 1
+fi
+rm -f "${dependency_link}"
+ln -s "${cache_root}/node_modules" "${dependency_link}"
+```
+
+**3. Wire it up in the scaffolded `main.ts`** — drop `node_modules` from `copyToWorktree` and run the script as a sandbox hook:
+
+```typescript
+const hooks = {
+  sandbox: {
+    onSandboxReady: [
+      {
+        command: "bash .sandcastle/prepare-dependencies.sh",
+        timeoutMs: 600_000,
+      },
+    ],
+  },
+};
+// Delete: const copyToWorktree = ["node_modules"];
+```
+
+Once the image carries the `sandcastle.dependency-lock.sha256` label, the planner templates verify it before the first round: hash matches → nothing happens; `package-lock.json` has drifted → the template rebuilds the image automatically, passing `DEPENDENCY_LOCK_SHA256` plus the usual `AGENT_UID`/`AGENT_GID` build args; label missing → the check skips silently, so adopting the recipe is the only required step. An unreachable container daemon fails fast with guidance instead of a confusing mid-run error. To rebuild by hand instead, pass the hash yourself:
+
+```bash
+sandcastle docker build-image --build-arg "DEPENDENCY_LOCK_SHA256=$(sha256sum package-lock.json | cut -d ' ' -f 1)"
+```
+
+### Custom issue tracker: Markdown files
+
+Choosing **Custom** at init scaffolds a deliberately broken-until-configured tracker plus `.sandcastle/SETUP_ISSUE_TRACKER.md` — feed that file to your coding agent and it interviews you, then wires up the tracker in place. The end state is three shell commands (list/view/close) baked into the scaffolded files. This worked example shows that end state for a tracker with no CLI at all: tasks as Markdown files, driven by a small Node script — the base image already has Node, so the Dockerfile needs nothing beyond removing the `# TODO` comment.
+
+A task file (`tasks/0042-add-retry-with-backoff.md`):
+
+```markdown
+# Add retry with backoff to the webhook sender
+
+Retries are exponential with jitter, capped at 5 attempts.
+
+## Acceptance criteria
+
+- Retries on 5xx responses, not on 4xx
+- ...
+```
+
+`scripts/task-tracker.mjs`:
+
+```javascript
+#!/usr/bin/env node
+// Minimal Markdown issue tracker over tasks/*.md.
+//   node scripts/task-tracker.mjs list
+//   node scripts/task-tracker.mjs view <id>
+//   node scripts/task-tracker.mjs close <id>
+import { readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+
+const TASKS_DIR = "tasks";
+const fileFor = (id) => join(TASKS_DIR, `${id}.md`);
+
+const listTasks = () =>
+  readdirSync(TASKS_DIR)
+    .filter((file) => file.endsWith(".md"))
+    .map((file) => {
+      const content = readFileSync(join(TASKS_DIR, file), "utf8");
+      return {
+        id: file.replace(/\.md$/, ""),
+        title: (content.match(/^#\s+(.+)$/m) ?? [])[1] ?? file,
+        body: content.replace(/^#[^\n]*\n?/m, "").trim(),
+        open: !/^status:\s*done/im.test(content),
+      };
+    });
+
+const [command, id] = process.argv.slice(2);
+switch (command) {
+  case "list":
+    // Sandcastle reads a JSON array; id, title, and body are what prompts use.
+    console.log(
+      JSON.stringify(
+        listTasks().filter((task) => task.open),
+        null,
+        2,
+      ),
+    );
+    break;
+  case "view":
+    console.log(readFileSync(fileFor(id), "utf8"));
+    break;
+  case "close":
+    writeFileSync(
+      fileFor(id),
+      `${readFileSync(fileFor(id), "utf8").trimEnd()}\nstatus: done\n`,
+    );
+    break;
+  default:
+    console.error(
+      "usage: node scripts/task-tracker.mjs list | view <id> | close <id>",
+    );
+    process.exit(1);
+}
+```
+
+Wiring the commands into the scaffolded prompt files — the list command sits inside a Sandcastle shell expression (leading `!`, backtick-quoted) whose stdout is injected into the prompt before each run; a non-zero exit fails the run, which is what keeps the custom scaffold broken until configured:
+
+```markdown
+<issues-json>
+
+!`node scripts/task-tracker.mjs list`
+
+</issues-json>
+```
+
+Then replace the view/close markers the scaffold left behind (e.g. in the planner templates' `implement-prompt.md` and `merge-prompt.md`):
+
+```
+Pull in the issue using `node scripts/task-tracker.mjs view <ID>`.
+```
+
+```
+For each branch that was merged, close its issue using the following command:
+
+`node scripts/task-tracker.mjs close <ID>`
+```
+
 ### Hooks
 
 Hooks are grouped by **where** they run — `host` (on the developer's machine) or `sandbox` (inside the container):
@@ -1384,6 +1607,28 @@ hooks: {
 - Within each hook point, sandbox hooks run in parallel; host hooks within `onSandboxReady` also run in parallel with sandbox hooks. `host.onWorktreeReady` hooks run sequentially in declared order.
 - If any hook exits non-zero, setup fails fast.
 - When a `signal` is passed to `run()`, it is threaded to all hooks — aborting the signal cancels any in-flight hook commands.
+
+### Running in the background on Windows
+
+A planner run is long-lived, and closing its terminal on Windows kills it. Launch it detached from PowerShell with output redirected to log files you can tail:
+
+```powershell
+$logDir = Join-Path ".sandcastle" "run-logs"
+New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+$run = Get-Date -Format "yyyyMMdd-HHmmss"
+$stdout = Join-Path $logDir "sandcastle-$run.stdout.log"
+$stderr = Join-Path $logDir "sandcastle-$run.stderr.log"
+
+$process = Start-Process -FilePath "cmd.exe" `
+  -ArgumentList "/d", "/c", "npx --yes tsx .sandcastle/main.ts 1> `"$stdout`" 2> `"$stderr`"" `
+  -WindowStyle Hidden -PassThru
+
+"Started Sandcastle in the background (PID $($process.Id))."
+"Standard output: $stdout"
+"Standard error:  $stderr"
+```
+
+Follow the run with `Get-Content -Wait $stdout`. The template's `Ctrl+C` handler doesn't apply to a detached process — Windows terminates it without a shutdown signal, so `Stop-Process -Id <PID>` skips container cleanup. Remove any leftovers with `docker ps --filter name=sandcastle-` and `docker rm -f <id>` (or the `podman` equivalents).
 
 ## Development
 

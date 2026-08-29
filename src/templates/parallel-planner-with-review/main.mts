@@ -299,11 +299,14 @@ const currentBranch = (): string => {
 
 // Clean-worktree precheck: the planner and merger phases run against the host
 // working directory, so uncommitted changes would leak into their runs.
+// `--untracked-files=normal` (dirs collapsed to one line) rather than `all` —
+// enumerating every file of a large untracked tree (e.g. an un-ignored
+// node_modules) can overflow spawnSync's buffer and fail the check outright.
 const requireCleanWorktree = (): void => {
   const status = gitOutput([
     "status",
     "--porcelain=v1",
-    "--untracked-files=all",
+    "--untracked-files=normal",
   ]);
   if (status !== "") {
     throw new Error(
